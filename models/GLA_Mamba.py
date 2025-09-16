@@ -1,0 +1,313 @@
+from __future__ import print_function, division
+
+import csv
+import os
+import sys
+from collections import OrderedDict
+from functools import partial
+from typing import Callable, Optional, List, NamedTuple, Any
+from torch.nn import CrossEntropyLoss
+import torch
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, utils
+from torch import nn
+import torch.optim as optim
+import pickle
+from PIL import Image
+from torch.cuda import amp
+from sklearn.metrics import roc_auc_score, balanced_accuracy_score, matthews_corrcoef
+from torchvision.ops import Conv2dNormActivation, MLP
+from torchvision.utils import _log_api_usage_once
+from tqdm import tqdm
+import argparse
+import warnings
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import math
+import logging
+from timm.models.vision_transformer import Mlp
+from dataset.Chest_Xray_Images import CustomImageDataset
+from GLAE import BlockWithCNN
+from agent_mamba import MixerMLPAttnMLP
+from agent_attention import AgentBlock
+
+if not sys.warnoptions:
+    warnings.simplefilter("ignore")
+
+class MLPBlock(MLP):
+
+    _version = 2
+
+    def __init__(self, in_dim: int, mlp_dim: int, dropout: float):
+        super().__init__(in_dim, [mlp_dim, in_dim], activation_layer=nn.GELU, inplace=None, dropout=dropout)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.normal_(m.bias, std=1e-6)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        version = local_metadata.get("version", None)
+
+        if version is None or version < 2:
+            # Replacing legacy MLPBlock with MLP. See https://github.com/pytorch/vision/pull/6053
+            for i in range(2):
+                for type in ["weight", "bias"]:
+                    old_key = f"{prefix}linear_{i+1}.{type}"
+                    new_key = f"{prefix}{3*i}.{type}"
+                    if old_key in state_dict:
+                        state_dict[new_key] = state_dict.pop(old_key)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+class ConvStemConfig(NamedTuple):
+    out_channels: int
+    kernel_size: int
+    stride: int
+    norm_layer: Callable[..., nn.Module] = nn.BatchNorm2d
+    activation_layer: Callable[..., nn.Module] = nn.ReLU
+
+class EncoderBlock(nn.Module):
+
+    def __init__(
+            self,
+            num_heads: int,
+            hidden_dim: int,
+            mlp_dim: int,
+            dropout: float,
+            attention_dropout: float,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+
+        # Attention block
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention1 = MixerMLPAttnMLP(dim=768, num_heads=12,
+                          mixer_type='mamba',
+                          mixer_kwargs=dict(expansion_ratio=8 / 3, kernel_size=7, conv_ratio=0.5),
+                          head_type='mlp',
+                          agent = True)
+        self.dropout = nn.Dropout(dropout)
+
+        # MLP block
+        self.ln_2 = norm_layer(hidden_dim)
+        self.head = MLPBlock(hidden_dim, mlp_dim, dropout)
+        # self.head = KAN([hidden_dim, 64, hidden_dim])
+
+    def forward(self, input: torch.Tensor):
+        b, t, d = input.shape
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        x = self.ln_1(input)
+        x = self.self_attention1(x)
+        x = self.dropout(x)
+        x = x + input
+
+        y = self.ln_2(x)
+
+        if isinstance(self.head, Mlp): y = self.mlp(y)
+        else:
+            y = y.reshape(-1, y.shape[-1])
+            y = self.head(y).reshape(b, t, d)
+        return x + y
+
+
+class myEncoder(nn.Module):
+
+    def __init__(
+            self,
+            seq_length: int,
+            num_layers: int,
+            num_heads: int,
+            hidden_dim: int,
+            mlp_dim: int,
+            dropout: float,
+            attention_dropout: float,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        self.pos_embedding = nn.Parameter(torch.empty(1, seq_length, hidden_dim).normal_(std=0.02))  # from BERT
+        self.dropout = nn.Dropout(dropout)
+        self.cnn_block = BlockWithCNN(dim=768, num_heads=12, qkv_bias=True,
+                                      qk_scale=None, drop_ratio=0, attn_drop_ratio=0)
+        layers: OrderedDict[str, nn.Module] = OrderedDict()
+        for i in range(num_layers):
+            layers[f"encoder_layer_{i}"] = EncoderBlock(
+                num_heads,
+                hidden_dim,
+                mlp_dim,
+                dropout,
+                attention_dropout,
+                norm_layer,
+            )
+        self.layers = nn.Sequential(layers)
+        self.ln = norm_layer(hidden_dim)
+
+    def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        input = input + self.pos_embedding
+        input = self.cnn_block(input)
+        return self.ln(self.layers(self.dropout(input)))
+
+class GLAMamba(nn.Module):
+
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        num_classes: int = 3,
+        representation_size: Optional[int] = None,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        conv_stem_configs: Optional[List[ConvStemConfig]] = None,
+    ):
+        super().__init__()
+        _log_api_usage_once(self)
+        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+        self.mlp_dim = mlp_dim
+        self.attention_dropout = attention_dropout
+        self.dropout = dropout
+        self.num_classes = num_classes
+        self.representation_size = representation_size
+        self.norm_layer = norm_layer
+
+        if conv_stem_configs is not None:
+            seq_proj = nn.Sequential()
+            prev_channels = 3
+            for i, conv_stem_layer_config in enumerate(conv_stem_configs):
+                seq_proj.add_module(
+                    f"conv_bn_relu_{i}",
+                    Conv2dNormActivation(
+                        in_channels=prev_channels,
+                        out_channels=conv_stem_layer_config.out_channels,
+                        kernel_size=conv_stem_layer_config.kernel_size,
+                        stride=conv_stem_layer_config.stride,
+                        norm_layer=conv_stem_layer_config.norm_layer,
+                        activation_layer=conv_stem_layer_config.activation_layer,
+                    ),
+                )
+                prev_channels = conv_stem_layer_config.out_channels
+            seq_proj.add_module(
+                "conv_last", nn.Conv2d(in_channels=prev_channels, out_channels=hidden_dim, kernel_size=1)
+            )
+            self.conv_proj: nn.Module = seq_proj
+        else:
+            self.conv_proj = nn.Conv2d(
+                in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
+            )
+
+        seq_length = (image_size // patch_size) ** 2
+
+        # Add a class token
+        self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        seq_length += 1
+
+        self.encoder = myEncoder(
+            seq_length,
+            num_layers,
+            num_heads,
+            hidden_dim,
+            mlp_dim,
+            dropout,
+            attention_dropout,
+            norm_layer,
+        )
+        heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
+        if representation_size is None:
+            heads_layers["head"] = nn.Linear(hidden_dim, num_classes)
+        else:
+            heads_layers["pre_logits"] = nn.Linear(hidden_dim, representation_size)
+            heads_layers["act"] = nn.Tanh()
+            heads_layers["head"] = nn.Linear(representation_size, num_classes)
+
+        self.heads = nn.Sequential(heads_layers)
+
+        if isinstance(self.conv_proj, nn.Conv2d):
+            # Init the patchify stem
+            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
+            nn.init.trunc_normal_(self.conv_proj.weight, std=math.sqrt(1 / fan_in))
+            if self.conv_proj.bias is not None:
+                nn.init.zeros_(self.conv_proj.bias)
+        elif self.conv_proj.conv_last is not None and isinstance(self.conv_proj.conv_last, nn.Conv2d):
+            # Init the last 1x1 conv of the conv stem
+            nn.init.normal_(
+                self.conv_proj.conv_last.weight, mean=0.0, std=math.sqrt(2.0 / self.conv_proj.conv_last.out_channels)
+            )
+            if self.conv_proj.conv_last.bias is not None:
+                nn.init.zeros_(self.conv_proj.conv_last.bias)
+
+        if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
+            fan_in = self.heads.pre_logits.in_features
+            nn.init.trunc_normal_(self.heads.pre_logits.weight, std=math.sqrt(1 / fan_in))
+            nn.init.zeros_(self.heads.pre_logits.bias)
+
+        if isinstance(self.heads.head, nn.Linear):
+            nn.init.zeros_(self.heads.head.weight)
+            nn.init.zeros_(self.heads.head.bias)
+
+
+    def _process_input(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+        p = self.patch_size
+        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        n_h = h // p
+        n_w = w // p
+
+        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
+        x = self.conv_proj(x)
+        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)
+
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+        # The self attention layer expects inputs in the format (N, S, E)
+        # where S is the source sequence length, N is the batch size, E is the
+        # embedding dimension
+        x = x.permute(0, 2, 1)
+
+        return x
+
+    def forward(self, x: torch.Tensor):
+        # Reshape and permute the input tensor
+        x = self._process_input(x)
+        n = x.shape[0]
+
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+
+        x = self.encoder(x)
+
+        # Classifier "token" as used by standard language architectures
+        x = x[:, 0]
+
+        x = self.heads(x)
+
+        return x
