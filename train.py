@@ -65,7 +65,7 @@ def train(args):
     model = GLAMamba(
         image_size=224,
         patch_size=16,
-        num_layers=12,
+        num_layers=24,
         num_heads=12,
         hidden_dim=768,
         mlp_dim=3072,
@@ -196,4 +196,5 @@ def train(args):
         logger_test.info(
             f'Accuracy_per_class: {test_accuracy_per_class}, Accuracy_all: {test_overall_accuracy}')
         logger_test.info(f'balanced_acc: {balanced_acc}, mcc: {mcc}')
+
         logger_test.info(f'best_acc: {max_acc}')
